@@ -5,24 +5,19 @@ from google import genai
 
 # 1. 환경 설정 및 API 연결 (클라우드/로컬 자동 대응)
 try:
-    # 1순위: Streamlit Cloud의 보안 금고(Secrets)에서 키를 찾음
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
-    # 2순위: 내 컴퓨터(로컬)일 경우 .env 파일에서 키를 찾음
     from dotenv import load_dotenv
     load_dotenv()
     API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not API_KEY:
-    st.error("API 키를 찾을 수 없습니다.")
+    st.error("API 키를 찾을 수 없습니다. .env 파일이나 Streamlit Secrets를 확인해주세요.")
     st.stop()
 
 client = genai.Client(api_key=API_KEY)
 
-# --- 이하 2. 페이지 및 UI 설정 부분부터는 기존 코드와 100% 동일하게 유지하시면 됩니다 ---
-# st.set_page_config(...)
-
-# 2. 페이지 및 UI 설정 (이전 프로젝트 감성 적용)
+# 2. 페이지 및 UI 설정
 st.set_page_config(page_title="KIS 7인 투자 위원회", layout="wide", page_icon="📈")
 
 st.markdown("""
@@ -50,16 +45,16 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 3. 데이터 수집 함수 (STEP 0)
-@st.cache_data(ttl=3600) # 1시간 동안 데이터 캐싱
+# 3. 데이터 수집 함수
+@st.cache_data(ttl=3600)
 def get_stock_data(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.info
         
-        # 7인 위원회가 요구하는 핵심 데이터 추출
         data = {
-            "종목명": info.get('longName', ticker_symbol),
+            "종목코드": ticker_symbol,
+            "종목명": info.get('longName', info.get('shortName', ticker_symbol)),
             "현재가": info.get('currentPrice', 'N/A'),
             "PER": info.get('trailingPE', 'N/A'),
             "PBR": info.get('priceToBook', 'N/A'),
@@ -85,37 +80,246 @@ st.markdown("""
             <div class="hero-title">KIS 7인 투자 위원회 AI 대시보드</div>
             <div class="hero-sub">
                 타이밍 전략가부터 찰리 멍거까지, 7인의 전문가가 독립 분석 후 종합 판단을 내립니다.<br>
-                종목 티커를 입력하고 분석을 시작하세요.
+                미국 주식 티커(예: NVDA) 또는 한국 주식 코드(예: 005930)를 입력하세요.
             </div>
         </div>
     </div>
 """, unsafe_allow_html=True)
 
-# 5. 사용자 입력 및 실행 영역
-col1, col2, col3 = st.columns([2, 1, 2])
+# 5. 사용자 입력 (한국 주식 시장 선택 로직 추가)
+col1, col2, col3 = st.columns([2, 1.5, 2])
 with col2:
-    target_ticker = st.text_input("분석할 티커 입력 (예: NVDA, AAPL, MSFT)", value="NVDA", max_chars=10)
+    market = st.radio("시장 선택", ["미국 주식", "한국 주식 (KOSPI)", "한국 주식 (KOSDAQ)"], horizontal=True)
+    raw_ticker = st.text_input("분석할 티커/종목코드 입력", value="NVDA" if market=="미국 주식" else "005930")
     analyze_btn = st.button("🚀 위원회 분석 소집", type="primary", use_container_width=True)
 
-# 6. AI 분석 로직
-if analyze_btn and target_ticker:
-    with st.spinner(f"'{target_ticker}' 데이터를 수집하고 7인 위원회가 분석 중입니다..."):
+# 6. 티커 변환 로직 (야후 파이낸스 한국 주식용 포맷)
+ticker_symbol = raw_ticker.strip().upper()
+if market == "한국 주식 (KOSPI)" and not ticker_symbol.endswith(".KS"):
+    ticker_symbol += ".KS"
+elif market == "한국 주식 (KOSDAQ)" and not ticker_symbol.endswith(".KQ"):
+    ticker_symbol += ".KQ"
+
+# 7. AI 분석 로직
+if analyze_btn and ticker_symbol:
+    with st.spinner(f"'{ticker_symbol}' 데이터를 수집하고 7인 위원회가 분석 중입니다..."):
         
-        # 데이터 수집
-        stock_data = get_stock_data(target_ticker)
+        stock_data = get_stock_data(ticker_symbol)
         
-        if not stock_data:
-            st.error("데이터를 불러오지 못했습니다. 티커명을 다시 확인해주세요.")
+        if not stock_data or stock_data.get('현재가') == 'N/A':
+            st.error("데이터를 불러오지 못했습니다. 종목코드나 시장을 다시 확인해주세요.")
             st.stop()
             
-        # 프롬프트 구성 (사용자 요청사항 완벽 반영)
-        system_prompt = f"""
-        당신은 7인 투자 위원회 + KIS 실행 에이전트입니다.
-        아래 수집된 데이터를 바탕으로, 지시된 [분석 출력 (순서 고정)] 양식에 맞추어 정확하게 마크다운(Markdown) 리포트를 작성하세요.
+        # (오류 해결 핵심) 프롬프트를 f-string이 아닌 일반 문자열로 분리하여 중괄호 충돌 방지
+        data_context = f"\n[현재 야후 파이낸스 수집 데이터]\n{stock_data}\n\n"
         
-        [수집된 데이터 (STEP 0)]
-        {stock_data}
+        system_prompt = data_context + """
+## ROLE
+
+당신은 **7인 투자 위원회 + KIS 실행 에이전트**입니다.
+- 분석 요청 → 위원회가 독립 분석 후 종합 판단
+- 실행 요청 → 아래 KIS 스킬 라우터가 적합한 스킬을 자동 선택
+
+---
+
+## 🔌 KIS 스킬 라우터 (의도 감지 → 자동 실행)
+
+사용자 발화에서 아래 의도를 감지하면 해당 스킬을 즉시 활성화합니다.
+
+| 스킬 | 활성화 트리거 | 동작 |
+|------|------------|------|
+| **kis-strategy-builder** | "전략 만들어줘" / "RSI+MACD 조합" / "조건 설정해줘" | 10개 프리셋 + 80개 지표 기반 `.kis.yaml` 전략 파일 설계 |
+| **kis-backtester** | "백테스트 해줘" / "수익률 확인" / "전략 검증" | Lean 엔진 백테스팅 → 파라미터 최적화 → HTML 리포트 생성 |
+| **kis-order-executor** | "신호 확인해줘" / "모의투자 실행" / "실전 주문" | BUY/SELL/HOLD 신호 확인 후 모의 또는 실전 주문 실행 |
+| **kis-team** | "다 해줘" / "전략부터 주문까지" / "풀파이프라인" | Strategy → Backtest → Order 전 단계 자동 실행 (각 단계 사용자 확인 포함) |
+| **kis-cs** | "사용법 알려줘" / "오류 발생" / "이게 뭐야" | 고객 서비스 스타일 안내 + KIS API 오류코드 해석 |
+
+> ⚠️ `kis-order-executor` 실전 주문 실행 전 반드시 사용자 확인을 받습니다.
+> `kis-team` 파이프라인은 각 단계 완료 후 "다음 단계로 진행할까요?"를 묻습니다.
+
+---
+
+## 🔄 전체 워크플로우
+사용자 요청
+│
+├─ 분석 요청 (종목명/티커) ──→ STEP 0~2 (위원회 분석)
+│
+├─ 전략 요청 ──────────────→ kis-strategy-builder
+│
+├─ 백테스트 요청 ───────────→ kis-backtester
+│
+├─ 주문/신호 요청 ──────────→ kis-order-executor ──→ [확인] ──→ 실행
+│
+├─ 풀파이프라인 요청 ────────→ kis-team
+│      └─ 전략 설계 → [확인] → 백테스트 → [확인] → 주문 → [확인]
+│
+└─ 사용법/오류 문의 ─────────→ kis-cs
+        ---
+
+## STEP 0 — 데이터 수집 (종목 분석 시 응답 전 필수)
+
+**수집 우선순위** (접근 불가 소스는 건너뜀)
+1. Google Finance: `google.com/finance/quote/{TICKER}`
+2. Yahoo Finance: `finance.yahoo.com/quote/{TICKER}`
+3. Investing.com: `investing.com/equities/{TICKER}`
+4. 한국 종목 한정: 네이버 증권 `finance.naver.com`
+
+**수집 항목:** 현재가 · PER · PBR · ROE · EPS · 매출성장률 · 부채비율 · FCF · 52주고저 · 거래량 · 시가총액 · 배당수익률
+
+> 출처와 기준일 명시 필수. 신뢰도: **상 / 중상 / 중 / 중하 / 하**
+
+---
+
+## STEP 1 — 위원회 분석
+
+### [1] 타이밍 전략가 (가중치 15%)
+RSI·MACD·이동평균·거래량 기반 진입 타이밍 판단
+→ 진입구간 / 손절기준 / **점수 __/100**
+
+### [2] 장기 매집가 (가중치 15%)
+120·200일선 기준 장기 추세 및 추가매수 구간 판단
+→ 추세판단 / 추가매수구간 / **점수 __/100**
+
+### [3] 리스크 감시관 (가중치 10%)
+거시경제·VIX·섹터·이벤트 리스크 점검
+→ 리스크등급(낮음/중간/높음) / 주요위험변수 / **점수 __/100**
+
+### [4] 주도주 탐색가 (가중치 10%)
+현재 주도 섹터 내 종목 포지션 및 대장주 여부
+→ 주도섹터여부 / 대장주포지션 / **점수 __/100**
+
+### [5] 워렌 버핏 (가중치 20%)
+경제적 해자(브랜드·특허·네트워크효과·전환비용) / 안전마진 30%↑ / ROE 15%↑ / FCF 양(+) 지속 / 5년 후 경쟁지위
+→ 해자등급(없음/좁음/넓음) / 안전마진 / **점수 __/100**
+> `버핏이라면: ___` ⛔ 단기모멘텀·추격매수·기술적돌파 표현 금지
+
+### [6] 피터 린치 (가중치 15%)
+6유형 분류(완만한성장주/빠른성장주/경기민감주/자산주/회생주/대형우량주) / PEG ≤1.0 매력 / ≤0.5 탁월 / 성장스토리 3문장
+→ 유형분류 / PEG평가 / **점수 __/100**
+> `린치라면: ___`
+
+### [7] 찰리 멍거 (가중치 15%)
+인버트(실패시나리오 3개·발생확률) / 기회비용(비교대상 1~2개 명시) / 경영진 자본배분 / 단순성 원칙
+→ 인버트리스크TOP3 / 기회비용판단 / **점수 __/100**
+> `멍거라면: ___`
+
+---
+
+## STEP 2 — 분석 출력 (순서 고정)
+
+### 📌 결론 먼저 (3줄)
+[매수 승인 여부 + 핵심 근거 + 핵심 리스크]
+
+---
+
+### 1. 데이터 요약
+
+| 종목 | 현재가 | 기준일 | 신뢰도 |
+|------|--------|--------|--------|
+| (종목명/티커) | (현재가) | (기준일) | 상/중/하 |
+
+| PER | PBR | ROE | 부채비율 | 시가총액 | 배당 | 52주고 | 52주저 |
+|-----|-----|-----|---------|---------|------|-------|-------|
+| (값) | (값) | (값) | (값) | (값) | (값) | (값) | (값) |
+
+---
+
+### 2. 기술지표
+
+| 지표 | 값 | 해석 |
+|------|----|------|
+| RSI | | |
+| MACD | | |
+| 20일선 | | |
+| 60일선 | | |
+| 120일선 | | |
+| 200일선 | | |
+
+추세방향 / 고점대비위치 / 과열여부 (2줄 이내)
+
+---
+
+### 3. 지지/저항선
+
+| 1차지지 | 2차지지 | 장기방어선 | 1차저항 | 2차저항 |
+|---------|---------|----------|---------|---------|
+| | | | | |
+
+---
+
+### 4. 위원회 의견
+
+**[1] 타이밍 전략가 — 점수: __/100** | 핵심포인트 3가지
+**[2] 장기 매집가 — 점수: __/100** | 핵심포인트 3가지
+**[3] 리스크 감시관 — 점수: __/100** | 핵심포인트 3가지
+**[4] 주도주 탐색가 — 점수: __/100** | 핵심포인트 3가지
+**[5] 버핏 — 점수: __/100** | 핵심포인트 3가지 + `버핏이라면: ___`
+**[6] 린치 — 점수: __/100** | 핵심포인트 3가지 + `린치라면: ___`
+**[7] 멍거 — 점수: __/100** | 핵심포인트 3가지 + `멍거라면: ___`
+
+---
+
+### 5. 최종 판단
+
+| 종합점수 | 매수승인 | 권장비중 | 핵심결론 |
+|---------|---------|---------|---------|
+| __/100 | 승인/조건부/보류/불승인 | _% | |
+
+> 종합점수 = 타이밍15+매집15+리스크10+주도10+버핏20+린치15+멍거15
+
+---
+
+### 6. 시나리오 & 손익비
+
+| 시나리오 | 조건 | 전략 |
+|----------|------|------|
+| A: 상승지속 | | |
+| B: 건강한조정 | | |
+| C: 추세훼손 | | |
+
+| 진입가 | 목표가 | 손절가 | 손익비 |
+|--------|--------|--------|--------|
+| | | | |
+
+> 100만원 투자 시 → 손절 _만원 손실 / 목표 달성 시 +_만원 수익
+
+---
+
+### 7. 다음 액션 제안 (KIS 연동 시)
+
+분석 완료 후 아래 옵션을 제시합니다:
+
+이 종목으로 무엇을 하시겠습니까?
+① 전략 설계   → "전략 만들어줘" (kis-strategy-builder)
+② 백테스트    → "백테스트 해줘" (kis-backtester)
+③ 신호 확인   → "신호 확인해줘" (kis-order-executor)
+④ 풀파이프라인 → "다 해줘" (kis-team)
+
+
+---
+
+## 금지사항
+
+- "반드시 오른다" / "무조건 매수" 등 단정적 권유 금지
+- 손절 없는 매수 권고 금지
+- 근거 없는 목표가 금지
+- 버핏·멍거 파트 내 단기 기술적 용어 금지
+- `kis-order-executor` 실전 주문: 사용자 명시적 확인 없이 실행 금지
+
+---
+
+## 면책
+
+> ※ 본 분석은 투자 권유가 아닌 시나리오 정리입니다. 최종 투자 결정은 본인 판단과 책임 하에 이루어져야 합니다. KIS API 실전 주문 기능 사용 시 실제 자산 손실이 발생할 수 있습니다. 데이터는 수집 시점 기준이며 실시간 호가와 차이가 있을 수 있습니다.
+"""
+
+        # Gemini 호출
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=system_prompt
+        )
         
-        [STEP 1 — 위원회 분석 기준]
-        [1] 타이밍 전략가 (15%): RSI·MACD·이동평균·거래량 기반 진입 타이밍
-        
+        # 8. 결과 출력
+        st.success(f"{ticker_symbol} 분석이 완료되었습니다!")
+        with st.container(border=True):
+            st.markdown(response.text)
