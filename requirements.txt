@@ -1,5 +1,6 @@
 streamlit
+pandas
 yfinance
+pykrx
 google-genai
 python-dotenv
-pandas
