@@ -4,3 +4,4 @@ yfinance
 pykrx
 google-genai
 python-dotenv
+setuptools==80.0.0
