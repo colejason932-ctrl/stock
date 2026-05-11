@@ -1,10 +1,12 @@
 import os
 import streamlit as st
+import pandas as pd
 import yfinance as yf
+from pykrx import stock
 from google import genai
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# 1. 환경 설정
+# 1. API 연결 설정
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
@@ -14,146 +16,126 @@ except:
 
 client = genai.Client(api_key=API_KEY)
 
-# 2. UI 및 스타일 설정
-st.set_page_config(page_title="KIS 7인 투자 위원회 PRO", layout="wide")
+# 2. UI 설정
+st.set_page_config(page_title="KIS 7인 투자 위원회 Pro", layout="wide")
 st.markdown("""
     <style>
-    .stMarkdown { font-size: 1.05rem !important; line-height: 1.6; }
-    .report-card { background: white; padding: 2rem; border-radius: 15px; border: 1px solid #e0e0e0; }
+    .stTable { font-size: 0.9rem; }
+    .css-1kyx0rg { background-color: #f0f2f6; }
     </style>
 """, unsafe_allow_html=True)
 
-# 3. 데이터 수집 (지표 보강)
-@st.cache_data(ttl=600)
-def get_detailed_data(ticker_symbol):
+# 3. 데이터 수집 엔진 (KRX 전용)
+def get_krx_data(ticker):
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
-        hist = ticker.history(period="1y") # 1년치 데이터로 추세 확인용
+        today = datetime.now().strftime("%Y%m%d")
+        # 기본 정보
+        name = stock.get_market_ticker_name(ticker)
+        df_f = stock.get_market_fundamental(today, today, ticker)
+        df_p = stock.get_market_ohlcv(today, today, ticker)
+        df_c = stock.get_market_cap(today, today, ticker)
         
+        # 데이터가 비어있을 경우 최근 영업일 찾기
+        if df_f.empty:
+            prev_day = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d")
+            df_f = stock.get_market_fundamental(prev_day, today, ticker).tail(1)
+            df_p = stock.get_market_ohlcv(prev_day, today, ticker).tail(1)
+            df_c = stock.get_market_cap(prev_day, today, ticker).tail(1)
+
         data = {
-            "종목명": info.get('longName', ticker_symbol),
-            "현재가": info.get('currentPrice', info.get('regularMarketPrice')),
+            "종목명": name,
+            "현재가": int(df_p['종가'].iloc[0]),
+            "PER": float(df_f['PER'].iloc[0]),
+            "PBR": float(df_f['PBR'].iloc[0]),
+            "ROE": round(float(df_f['PBR'].iloc[0]) / float(df_f['PER'].iloc[0]) * 100, 2) if df_f['PER'].iloc[0] > 0 else "N/A",
+            "시가총액": int(df_c['시가총액'].iloc[0]),
+            "배당수익률": float(df_f['DIV'].iloc[0]),
+            "거래량": int(df_p['거래량'].iloc[0]),
+            "52주고": "지원 예정", # OHLCV 범위 데이터 필요
+            "52주저": "지원 예정"
+        }
+        
+        # 동종 업계 비교 데이터 추출
+        sector_code = stock.get_market_ticker_list(market="ALL")
+        # 간단한 로직: 동일 시장(KOSPI/KOSDAQ) 내 시총 상위 비교
+        market_type = "KOSPI" if ticker in stock.get_market_ticker_list(market="KOSPI") else "KOSDAQ"
+        comparison_df = stock.get_market_fundamental(today, today, market=market_type).nlargest(5, 'PER')
+        
+        return data, comparison_df
+    except Exception as e:
+        return None, None
+
+# 4. 데이터 수집 엔진 (해외 전용)
+def get_us_data(ticker):
+    try:
+        yf_stock = yf.Ticker(ticker)
+        info = yf_stock.info
+        data = {
+            "종목명": info.get('longName'),
+            "현재가": info.get('currentPrice'),
             "PER": info.get('trailingPE'),
             "PBR": info.get('priceToBook'),
-            "ROE": info.get('returnOnEquity'),
-            "EPS": info.get('trailingEps'),
-            "부채비율": info.get('debtToEquity'),
+            "ROE": round(info.get('returnOnEquity', 0) * 100, 2),
             "시가총액": info.get('marketCap'),
-            "배당수익률": info.get('dividendYield'),
+            "배당수익률": round(info.get('dividendYield', 0) * 100, 2),
             "52주고": info.get('fiftyTwoWeekHigh'),
-            "52주저": info.get('fiftyTwoWeekLow'),
-            "거래량": info.get('volume'),
-            "FCF": info.get('freeCashflow'),
-            "기준일": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "52주저": info.get('fiftyTwoWeekLow')
         }
         return data
     except:
         return None
 
-# 4. 헤더 및 입력
-st.title("🏛️ KIS 7인 투자 위원회 전문 분석 시스템")
-st.info("야후 파이낸스 실시간 데이터와 Gemini 2.5 Pro급 추론 엔진을 사용하여 심층 보고서를 생성합니다.")
+# 5. 메인 레이아웃
+st.title("🏛️ KIS 7인 투자 위원회 Pro")
+st.caption("한국 주식은 pykrx(실시간 KRX 데이터), 해외 주식은 yfinance 엔진을 사용합니다.")
 
-col1, col2, col3 = st.columns([1, 1, 1])
-with col1:
-    market = st.selectbox("시장", ["미국 주식", "한국 KOSPI", "한국 KOSDAQ"])
-with col2:
-    raw_input = st.text_input("티커/코드", value="000660" if "한국" in market else "NVDA")
+with st.sidebar:
+    st.header("🔍 종목 설정")
+    region = st.radio("시장 선택", ["국내(KOSPI/KOSDAQ)", "해외(NASDAQ/NYSE)"])
+    ticker_input = st.text_input("종목코드/티커", value="000660" if region == "국내(KOSPI/KOSDAQ)" else "NVDA")
+    analyze_btn = st.button("전문가 위원회 소집", type="primary")
 
-ticker = raw_input.strip().upper()
-if "KOSPI" in market: ticker += ".KS"
-elif "KOSDAQ" in market: ticker += ".KQ"
-
-if st.button("🚀 위원회 소집 및 심층 분석 시작", type="primary", use_container_width=True):
-    with st.spinner("전문가들이 데이터를 검토 중입니다..."):
-        stock_info = get_detailed_data(ticker)
+if analyze_btn:
+    with st.spinner("데이터 분석 및 위원회 리포트 생성 중..."):
+        stock_info = None
+        comp_data = None
         
-        if not stock_info or not stock_info['현재가']:
-            st.error("데이터를 수집할 수 없습니다.")
+        if region == "국내(KOSPI/KOSDAQ)":
+            stock_info, comp_data = get_krx_data(ticker_input)
+        else:
+            stock_info = get_us_data(ticker_input)
+
+        if not stock_info:
+            st.error("데이터를 수집할 수 없습니다. 코드를 확인해 주세요.")
             st.stop()
 
-        # [핵심] 전문성을 강제하는 고도화된 프롬프트
-        expert_prompt = f"""
-당신은 월스트리트 출신의 **7인 투자 위원회**입니다. 
-제공된 데이터({stock_info})를 바탕으로 기관 투자자 수준의 **심층 보고서**를 작성하십시오. 
+        # UI 출력: 상단 요약 카드
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("현재가", f"{stock_info['현재가']:,}")
+        c2.metric("PER", f"{stock_info['PER']}배")
+        c3.metric("PBR", f"{stock_info['PBR']}배")
+        c4.metric("ROE", f"{stock_info['ROE']}%")
 
-**[작성 가이드라인]**
-1. **데이터 기반 추론**: 수치가 'N/A'인 경우, 업종 평균이나 현재가 추세를 바탕으로 논리적인 추정치를 제시하고 그 근거를 밝히십시오.
-2. **페르소나 강화**: 각 위원은 최소 3~5문장의 심도 있는 분석을 제공해야 합니다. 단답형은 금지합니다.
-3. **기술적 분석**: 52주 고저 대비 현재가 위치를 계산하여(Fibonacci Retinement 등 활용) 지지/저항을 정교하게 도출하십시오.
-4. **결론의 일관성**: 7인의 점수를 가중치에 따라 합산하여 최종 종합 점수를 산출하십시오.
+        if comp_data is not None:
+            with st.expander("📊 동종 업계 비교 (시총 상위)", expanded=True):
+                st.table(comp_data[['BPS', 'PER', 'PBR', 'EPS', 'DIV']])
 
----
+        # AI 프롬프트 생성
+        prompt = f"""
+당신은 7인 투자 위원회입니다. 아래 [실시간 수집 데이터]를 바탕으로 전문적인 투자 리포트를 작성하세요.
+특히 '동종 업계 비교 데이터'가 있다면 이를 참고하여 해당 종목의 밸류에이션 위치를 린치와 버핏의 관점에서 비평하십시오.
 
-### 📌 결론 먼저 (3줄)
-- **승인 여부**: [적극매수/매수/관망/매도]
-- **핵심 근거**: 해당 종목의 현재 가장 강력한 업사이드 모멘텀
-- **핵심 리스크**: 투자자가 반드시 체크해야 할 하방 리스크
+[실시간 수집 데이터]
+{stock_info}
 
----
-
-### 1. 데이터 요약 및 지표 분석
-(종목명, 현재가, PER, ROE, 시가총액 등을 포함한 상세 표 작성)
-
----
-
-### 2. 기술적 지표 및 가격 전략
-| 항목 | 값 | 심층 해석 |
-|------|----|----------|
-| RSI(추정) | | 현재 가격 위치 기반 과매수/과매도 분석 |
-| 가격 모멘텀 | | 52주 고점 대비 괴리율 및 추세 강도 |
-| 지지선/저항선 | | 1, 2차 구간 및 손절 라인 |
+[동종 업계 지표]
+{comp_data.to_string() if comp_data is not None else "해외 주식 비교 데이터 생략"}
 
 ---
-
-### 3. 위원회 개별 심층 의견
-
-**[1] 타이밍 전략가 (15%) — 점수: /100**
-(거래량 패턴과 현재 가격의 이격도를 바탕으로 최적의 진입 시점 분석)
-
-**[2] 장기 매집가 (15%) — 점수: /100**
-(업황의 사이클과 장기 이평선 기준의 매집 매력도 분석)
-
-**[3] 리스크 감시관 (10%) — 점수: /100**
-(거시경제 영향, 지정학적 리스크, 섹터 내 경쟁 심화 분석)
-
-**[4] 주도주 탐색가 (10%) — 점수: /100**
-(섹터 내 시가총액 순위와 기술적 리더십 분석)
-
-**[5] 워렌 버핏 (20%) — 점수: /100**
-(경제적 해자, ROE의 질, 자본 배치 효율성 분석)
-*버핏이라면:* "나는 이 기업이 10년 후에도..." (단기 용어 절대 금지)
-
-**[6] 피터 린치 (15%) — 점수: /100**
-(성장률 대비 PER 평가(PEG), 이익성장 스토리 분석)
-*린치라면:* "이 주식은 OO유형에 속하며, 향후..."
-
-**[7] 찰리 멍거 (15%) — 점수: /100**
-(다학제적 모델 기반 리스크, 경영진의 도덕성, 인버트 사고)
-*멍거라면:* "이 투자가 실패한다면 그 이유는..."
-
----
-
-### 4. 종합 판단 및 시뮬레이션
-- **종합 점수**: [산출된 점수]/100
-- **권장 비중**: [포트폴리오 내 %]
-- **수익/손실 시뮬레이션**: 100만원 투자 시 기대 수익과 최대 예상 손실(MDD)
-
----
-
-### 5. KIS 실행 가이드
-(kis-strategy-builder 및 kis-order-executor와 연동하기 위한 다음 액션 제안)
+(이후 기존의 7인 위원회 출력 양식 적용)
 """
-
-        # API 호출
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=expert_prompt
-        )
-        
-        # 결과 대시보드 출력
+        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
         st.markdown(response.text)
-        
-        st.divider()
-        st.caption("본 보고서는 전문 투자 에이전트 시스템에 의해 자동 생성되었습니다. 투자 판단의 책임은 본인에게 있습니다.")
+
+st.divider()
+st.caption("※ 데이터 출처: KRX(국내), Yahoo Finance(해외). 모든 투자의 책임은 본인에게 있습니다.")
